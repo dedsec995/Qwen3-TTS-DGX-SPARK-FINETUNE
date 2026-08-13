@@ -1,0 +1,24 @@
+# Pre-installed by user: torch==2.13 (with CUDA 13), flash-attn==2.8.3
+
+torch==2.13
+torchaudio==2.11.0
+torchvision==0.28.0
+
+# Core and Data prep
+pydub
+numpy==2.5.2
+librosa==1.0.0
+soundfile
+tqdm==4.70.0
+
+# Transformers and ML
+transformers==4.57.3
+accelerate==1.12.0
+safetensors
+huggingface_hub
+hf_transfer
+
+# Model specific
+qwen-tts==0.1.1
+nemo_toolkit[asr]==3.0.0
+cython

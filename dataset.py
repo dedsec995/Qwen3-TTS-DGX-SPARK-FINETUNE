@@ -210,7 +210,14 @@ class TTSDataset(Dataset):
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
 
         ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        max_mel_len = max([mel.shape[1] for mel in ref_mels])
+        padded_mels = []
+        import torch.nn.functional as F
+        for mel in ref_mels:
+            pad_len = max_mel_len - mel.shape[1]
+            padded = F.pad(mel, (0, 0, 0, pad_len))
+            padded_mels.append(padded)
+        ref_mels = torch.cat(padded_mels, dim=0)
 
         return {
             'input_ids':input_ids,

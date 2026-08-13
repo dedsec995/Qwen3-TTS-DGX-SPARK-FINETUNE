@@ -224,7 +224,7 @@ class Qwen3TTSPipeline:
             results.append({
                 "audio": str(audio_path),
                 "text": text.strip(),
-                "ref_audio": str(self.ref_audio),
+                "ref_audio": str(audio_path),
             })
             print(f"  {audio_path.name}: {text.strip()[:100]}...")
 
@@ -367,7 +367,31 @@ class Qwen3TTSPipeline:
             qwen3tts.model, optimizer, train_dataloader
         )
 
-        target_speaker_embedding = None
+        # Extract target speaker embedding from the clean reference audio explicitly
+        print("Extracting target speaker embedding from reference.wav...")
+        import librosa
+        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
+        ref_audio_np, sr = librosa.load(str(self.ref_audio), sr=None, mono=True)
+        if ref_audio_np.ndim > 1:
+            ref_audio_np = np.mean(ref_audio_np, axis=-1)
+        ref_audio_np = librosa.resample(ref_audio_np, orig_sr=sr, target_sr=24000)
+        
+        ref_mels = mel_spectrogram(
+            torch.tensor(ref_audio_np).unsqueeze(0).to(torch.float32),
+            n_fft=1024,
+            num_mels=128,
+            sampling_rate=24000,
+            hop_size=256,
+            win_size=1024,
+            fmin=0,
+            fmax=12000
+        ).transpose(1, 2)
+        
+        # Now qwen3tts.model is on accelerator.device
+        target_speaker_embedding = qwen3tts.model.speaker_encoder(
+            ref_mels.to(accelerator.device).to(self.torch_dtype)
+        ).detach()
+
         model.train()
 
         # Training loop
@@ -388,9 +412,6 @@ class Qwen3TTSPipeline:
                     speaker_embedding = model.speaker_encoder(
                         ref_mels.to(model.device).to(model.dtype)
                     ).detach()
-
-                    if target_speaker_embedding is None:
-                        target_speaker_embedding = speaker_embedding
 
                     input_text_ids = input_ids[:, :, 0]
                     input_codec_ids = input_ids[:, :, 1]

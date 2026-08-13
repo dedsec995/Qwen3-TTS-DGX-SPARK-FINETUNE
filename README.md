@@ -57,7 +57,7 @@ python fine_tune_qwen.py \
     --output_dir ./output \
     --num_epochs 24 \
     --save_every_n_epochs 6 \
-    --lr 3e-5 \
+    --lr 3e-6 \
     --batch_size 12 \
     --transcribe_batch_size 8 \
     --gradient_accumulation_steps 4

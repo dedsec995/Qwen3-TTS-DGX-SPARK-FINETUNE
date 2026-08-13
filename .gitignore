@@ -1,3 +1,8 @@
+audio_chunks
+output*
+raw_audio/*
+reference.wav
+
 # Project-specific
 CLAUDE.md
 .serena/

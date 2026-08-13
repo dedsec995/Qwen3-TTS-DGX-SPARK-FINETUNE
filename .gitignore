@@ -1,0 +1,71 @@
+# Project-specific
+CLAUDE.md
+.serena/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Output and models
+output/
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Training artifacts
+train_raw.jsonl
+train_with_codes.jsonl
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+tensorboard/
+
+# HuggingFace cache (if outside venv)
+.cache/
+huggingface/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/

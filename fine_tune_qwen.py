@@ -196,11 +196,11 @@ class Qwen3TTSPipeline:
         print(f"{'='*60}\n")
 
         # Load NeMo Parakeet model
-        print("Loading NeMo Parakeet model (nvidia/parakeet-tdt-1.1b)...")
+        print("Loading NeMo Parakeet model (nvidia/parakeet-rnnt-1.1b)...")
         device = "cuda" if self.device.startswith("cuda") else "cpu"
         
         try:
-            asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-1.1b")
+            asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-rnnt-1.1b")
         except Exception as e:
             print(f"Error loading model: {e}")
             raise

@@ -58,13 +58,14 @@ from tqdm import tqdm
 
 
 class Qwen3TTSPipeline:
-    """End-to-end pipeline for Qwen3-TTS fine-tuning."""
+    """End-to-end pipeline for Qwen3-TTS multi-speaker fine-tuning."""
 
     def __init__(
         self,
         audio_dir: str,
-        ref_audio: str,
-        speaker_name: str,
+        ref_audio: str = None,
+        ref_audio_dir: str = None,
+        speaker_name: str = "my_speaker",
         output_dir: str = "./output",
         device: str = "cuda:0",
         tokenizer_model_path: str = "Qwen/Qwen3-TTS-Tokenizer-12Hz",
@@ -77,9 +78,11 @@ class Qwen3TTSPipeline:
         num_epochs: int = 3,
         save_every_n_epochs: int = 1,
         language: str = "en",
+        speaker_prefix_template: str = "Speaker {speaker}: {text}",
     ):
         self.audio_dir = Path(audio_dir)
-        self.ref_audio = Path(ref_audio)
+        self.ref_audio = Path(ref_audio) if ref_audio else None
+        self.ref_audio_dir = Path(ref_audio_dir) if ref_audio_dir else None
         self.speaker_name = speaker_name
         self.output_dir = Path(output_dir)
         self.device = device
@@ -93,6 +96,11 @@ class Qwen3TTSPipeline:
         self.num_epochs = num_epochs
         self.save_every_n_epochs = save_every_n_epochs
         self.language = language
+        self.speaker_prefix_template = speaker_prefix_template
+
+        # Speaker metadata tracking
+        self.speakers = []
+        self.speaker_ref_audios = {}
 
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -105,28 +113,78 @@ class Qwen3TTSPipeline:
         self.attn_implementation = get_attention_implementation()
 
     def validate_audio_files(self) -> List[Path]:
-        """Find and validate all WAV files in the audio directory."""
+        """Find and validate all WAV files in the audio directory (flat or multi-speaker)."""
         if not self.audio_dir.exists():
             raise ValueError(f"Audio directory not found: {self.audio_dir}")
 
-        wav_files = list(self.audio_dir.glob("*.wav")) + list(self.audio_dir.glob("*.WAV"))
+        all_wav_files = (
+            list(self.audio_dir.rglob("*.wav")) + list(self.audio_dir.rglob("*.WAV"))
+        )
 
-        if not wav_files:
+        if not all_wav_files:
             raise ValueError(f"No WAV files found in {self.audio_dir}")
 
-        if not self.ref_audio.exists():
-            raise ValueError(f"Reference audio not found: {self.ref_audio}")
-
-        # Validate audio files can be loaded
+        speaker_file_map = {}
         valid_files = []
-        for wav_path in tqdm(wav_files, desc="Validating audio files"):
+
+        # Validate audio files can be loaded and group by speaker
+        for wav_path in tqdm(all_wav_files, desc="Validating audio files"):
             try:
                 torchaudio.load(str(wav_path))
+                
+                # Determine speaker name based on directory hierarchy
+                if wav_path.parent != self.audio_dir:
+                    speaker = wav_path.parent.name
+                else:
+                    speaker = self.speaker_name
+
+                if speaker not in speaker_file_map:
+                    speaker_file_map[speaker] = []
+                speaker_file_map[speaker].append(wav_path)
                 valid_files.append(wav_path)
             except Exception as e:
                 print(f"Warning: Could not load {wav_path}: {e}")
 
-        print(f"Found {len(valid_files)} valid audio files")
+        if not valid_files:
+            raise ValueError(f"No valid audio files could be loaded from {self.audio_dir}")
+
+        self.speakers = sorted(list(speaker_file_map.keys()))
+
+        # Determine reference audio for each speaker
+        print(f"\n{'='*60}")
+        print(f"Discovered {len(self.speakers)} speaker(s) across {len(valid_files)} audio chunks:")
+        for speaker in self.speakers:
+            speaker_files = speaker_file_map[speaker]
+            ref_path = None
+
+            # 1. Check ref_audio_dir if provided
+            if self.ref_audio_dir and self.ref_audio_dir.exists():
+                candidates = [
+                    self.ref_audio_dir / f"{speaker}.wav",
+                    self.ref_audio_dir / f"{speaker}.WAV",
+                    self.ref_audio_dir / f"reference_{speaker}.wav",
+                    self.ref_audio_dir / f"reference_{speaker}.WAV",
+                ]
+                for c in candidates:
+                    if c.exists():
+                        ref_path = c
+                        break
+
+            # 2. Check if global ref_audio was provided and exists
+            if ref_path is None and self.ref_audio and self.ref_audio.exists():
+                ref_path = self.ref_audio
+
+            # 3. Fallback to the first audio chunk of this speaker
+            if ref_path is None and speaker_files:
+                ref_path = speaker_files[0]
+
+            if ref_path is None or not Path(ref_path).exists():
+                raise ValueError(f"Could not determine valid reference audio for speaker '{speaker}'")
+
+            self.speaker_ref_audios[speaker] = Path(ref_path)
+            print(f"  - Speaker '{speaker}': {len(speaker_files)} chunks | Reference audio: {ref_path}")
+        print(f"{'='*60}\n")
+
         return valid_files
 
     def check_dependencies(self) -> None:
@@ -185,9 +243,9 @@ class Qwen3TTSPipeline:
 
     def transcribe_with_parakeet(self, audio_files: List[Path]) -> List[Dict[str, Any]]:
         """
-        Transcribe audio files using NeMo Parakeet.
+        Transcribe audio files using NeMo Parakeet and format with speaker tags.
 
-        Returns a list of dictionaries with audio path and transcription.
+        Returns a list of dictionaries with audio path, speaker-tagged text, and ref_audio.
         """
         import nemo.collections.asr as nemo_asr
 
@@ -221,12 +279,27 @@ class Qwen3TTSPipeline:
             if hasattr(text, 'text'):
                 text = text.text
                 
+            clean_text = text.strip()
+
+            # Determine speaker name from parent directory or default
+            if audio_path.parent != self.audio_dir:
+                speaker = audio_path.parent.name
+            else:
+                speaker = self.speaker_name
+
+            # Apply speaker prefix conditioning if requested
+            if self.speaker_prefix_template:
+                tagged_text = self.speaker_prefix_template.format(speaker=speaker, text=clean_text)
+            else:
+                tagged_text = clean_text
+
             results.append({
                 "audio": str(audio_path),
-                "text": text.strip(),
+                "text": tagged_text,
                 "ref_audio": str(audio_path),
+                "speaker": speaker,
             })
-            print(f"  {audio_path.name}: {text.strip()[:100]}...")
+            print(f"  [{speaker}] {audio_path.name}: {tagged_text[:100]}...")
 
         # Cleanup model
         del asr_model
@@ -235,7 +308,6 @@ class Qwen3TTSPipeline:
 
         print(f"\nSuccessfully transcribed {len(results)} files")
         return results
-
 
     def create_train_jsonl(self, data: List[Dict[str, Any]]) -> None:
         """Create the train_raw.jsonl file."""
@@ -315,8 +387,11 @@ class Qwen3TTSPipeline:
         print(f"{'='*60}\n")
 
         # Import training modules
+        import librosa
+        import numpy as np
         from dataset import TTSDataset
         from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
         from transformers import AutoConfig
         from torch.optim import AdamW
         from torch.utils.data import DataLoader
@@ -350,6 +425,20 @@ class Qwen3TTSPipeline:
 
         print(f"Training on {len(train_data)} samples")
 
+        # Ensure speakers list and reference audios are populated
+        if not self.speakers:
+            discovered_speakers = set()
+            for item in train_data:
+                if "speaker" in item:
+                    spk = item["speaker"]
+                else:
+                    audio_p = Path(item["audio"])
+                    spk = audio_p.parent.name if audio_p.parent != self.audio_dir else self.speaker_name
+                discovered_speakers.add(spk)
+                if spk not in self.speaker_ref_audios:
+                    self.speaker_ref_audios[spk] = Path(item.get("ref_audio", item["audio"]))
+            self.speakers = sorted(list(discovered_speakers))
+
         # Create dataset and dataloader
         dataset = TTSDataset(train_data, qwen3tts.processor, config)
         train_dataloader = DataLoader(
@@ -367,30 +456,38 @@ class Qwen3TTSPipeline:
             qwen3tts.model, optimizer, train_dataloader
         )
 
-        # Extract target speaker embedding from the clean reference audio explicitly
-        print("Extracting target speaker embedding from reference.wav...")
-        import librosa
-        from qwen_tts.core.models.modeling_qwen3_tts import mel_spectrogram
-        ref_audio_np, sr = librosa.load(str(self.ref_audio), sr=None, mono=True)
-        if ref_audio_np.ndim > 1:
-            ref_audio_np = np.mean(ref_audio_np, axis=-1)
-        ref_audio_np = librosa.resample(ref_audio_np, orig_sr=sr, target_sr=24000)
-        
-        ref_mels = mel_spectrogram(
-            torch.tensor(ref_audio_np).unsqueeze(0).to(torch.float32),
-            n_fft=1024,
-            num_mels=128,
-            sampling_rate=24000,
-            hop_size=256,
-            win_size=1024,
-            fmin=0,
-            fmax=12000
-        ).transpose(1, 2)
-        
-        # Now qwen3tts.model is on accelerator.device
-        target_speaker_embedding = qwen3tts.model.speaker_encoder(
-            ref_mels.to(accelerator.device).to(self.torch_dtype)
-        ).detach()
+        # Extract target speaker embeddings for all speakers
+        print(f"\nExtracting target speaker embeddings for {len(self.speakers)} speaker(s)...")
+        target_speaker_embeddings = {}
+        for speaker in self.speakers:
+            ref_path = self.speaker_ref_audios.get(speaker)
+            if ref_path is None or not Path(ref_path).exists():
+                ref_path = self.ref_audio if (self.ref_audio and self.ref_audio.exists()) else None
+
+            if ref_path is None:
+                raise ValueError(f"No reference audio found for speaker '{speaker}'")
+
+            print(f"  - Extracting embedding for '{speaker}' from {ref_path}...")
+            ref_audio_np, sr = librosa.load(str(ref_path), sr=None, mono=True)
+            if ref_audio_np.ndim > 1:
+                ref_audio_np = np.mean(ref_audio_np, axis=-1)
+            ref_audio_np = librosa.resample(ref_audio_np, orig_sr=sr, target_sr=24000)
+            
+            ref_mels = mel_spectrogram(
+                torch.tensor(ref_audio_np).unsqueeze(0).to(torch.float32),
+                n_fft=1024,
+                num_mels=128,
+                sampling_rate=24000,
+                hop_size=256,
+                win_size=1024,
+                fmin=0,
+                fmax=12000
+            ).transpose(1, 2)
+            
+            emb = qwen3tts.model.speaker_encoder(
+                ref_mels.to(accelerator.device).to(self.torch_dtype)
+            ).detach()
+            target_speaker_embeddings[speaker] = emb
 
         model.train()
 
@@ -408,7 +505,7 @@ class Qwen3TTSPipeline:
                     codec_0_labels = batch["codec_0_labels"]
                     codec_mask = batch["codec_mask"]
 
-                    # Get speaker embedding
+                    # Get speaker embedding dynamically from each sample's ref_mels
                     speaker_embedding = model.speaker_encoder(
                         ref_mels.to(model.device).to(model.dtype)
                     ).detach()
@@ -492,8 +589,11 @@ class Qwen3TTSPipeline:
                 config_dict["tts_model_type"] = "custom_voice"
 
                 talker_config = config_dict.get("talker_config", {})
-                talker_config["spk_id"] = {self.speaker_name: 3000}
-                talker_config["spk_is_dialect"] = {self.speaker_name: False}
+                spk_id_map = {speaker: 3000 + i for i, speaker in enumerate(self.speakers)}
+                spk_is_dialect_map = {speaker: False for speaker in self.speakers}
+
+                talker_config["spk_id"] = spk_id_map
+                talker_config["spk_is_dialect"] = spk_is_dialect_map
                 config_dict["talker_config"] = talker_config
 
                 with open(output_config_file, "w", encoding="utf-8") as f:
@@ -512,27 +612,28 @@ class Qwen3TTSPipeline:
                 for k in keys_to_drop:
                     del state_dict[k]
 
-                # Add speaker embedding
+                # Add speaker embeddings for each speaker
                 weight = state_dict["talker.model.codec_embedding.weight"]
-                state_dict["talker.model.codec_embedding.weight"][
-                    3000
-                ] = (
-                    target_speaker_embedding[0]
-                    .detach()
-                    .to(weight.device)
-                    .to(weight.dtype)
-                )
+                for i, speaker in enumerate(self.speakers):
+                    spk_id = 3000 + i
+                    speaker_emb = target_speaker_embeddings[speaker]
+                    state_dict["talker.model.codec_embedding.weight"][spk_id] = (
+                        speaker_emb[0]
+                        .detach()
+                        .to(weight.device)
+                        .to(weight.dtype)
+                    )
 
                 save_path = os.path.join(output_dir, "model.safetensors")
                 save_file(state_dict, save_path)
-                print(f"Saved checkpoint to {output_dir}")
+                print(f"Saved checkpoint with {len(self.speakers)} speaker(s) to {output_dir}")
 
         print("\nTraining complete!")
 
     def run(self) -> None:
         """Run the complete pipeline."""
         print(f"\n{'='*60}")
-        print("Qwen3-TTS End-to-End Fine-Tuning Pipeline")
+        print("Qwen3-TTS Multi-Speaker End-to-End Fine-Tuning Pipeline")
         print(f"{'='*60}\n")
 
         # Check dependencies
@@ -570,7 +671,7 @@ class Qwen3TTSPipeline:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Qwen3-TTS End-to-End Fine-Tuning Pipeline"
+        description="Qwen3-TTS Multi-Speaker End-to-End Fine-Tuning Pipeline"
     )
 
     # Input arguments
@@ -578,19 +679,31 @@ def main():
         "--audio_dir",
         type=str,
         required=True,
-        help="Directory containing WAV files to use for training",
+        help="Directory containing WAV files or speaker subdirectories (e.g., ./audio_chunks or ./audio_chunks/speaker_name)",
     )
     parser.add_argument(
         "--ref_audio",
         type=str,
-        required=True,
-        help="Path to reference audio file (WAV)",
+        default=None,
+        help="Optional fallback path to reference audio file (WAV)",
+    )
+    parser.add_argument(
+        "--ref_audio_dir",
+        type=str,
+        default=None,
+        help="Optional directory containing per-speaker reference WAV files (<speaker>.wav or reference_<speaker>.wav)",
     )
     parser.add_argument(
         "--speaker_name",
         type=str,
         default="my_speaker",
-        help="Name for the speaker being cloned",
+        help="Default speaker name to use if audio_dir is a flat folder with no speaker subdirectories",
+    )
+    parser.add_argument(
+        "--speaker_prefix_template",
+        type=str,
+        default="Speaker {speaker}: {text}",
+        help="Template for prompt conditioning in transcription (use '' to disable prompt prefixing)",
     )
 
     # Output arguments
@@ -675,10 +788,14 @@ def main():
 
     args = parser.parse_args()
 
+    # Handle empty template string
+    prefix_template = args.speaker_prefix_template if args.speaker_prefix_template.strip() else None
+
     # Run pipeline
     pipeline = Qwen3TTSPipeline(
         audio_dir=args.audio_dir,
         ref_audio=args.ref_audio,
+        ref_audio_dir=args.ref_audio_dir,
         speaker_name=args.speaker_name,
         output_dir=args.output_dir,
         device=args.device,
@@ -692,6 +809,7 @@ def main():
         num_epochs=args.num_epochs,
         save_every_n_epochs=args.save_every_n_epochs,
         language=args.language,
+        speaker_prefix_template=prefix_template,
     )
 
     pipeline.run()

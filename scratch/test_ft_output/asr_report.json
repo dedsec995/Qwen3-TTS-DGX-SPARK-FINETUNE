@@ -1,0 +1,19 @@
+{
+  "bert": {
+    "total": 193,
+    "kept": 191,
+    "secs": 1338.18,
+    "reasons": {
+      "repetition": 2
+    }
+  },
+  "shiv": {
+    "total": 130,
+    "kept": 127,
+    "secs": 865.1149999999997,
+    "reasons": {
+      "repetition": 2,
+      "rate_low": 1
+    }
+  }
+}

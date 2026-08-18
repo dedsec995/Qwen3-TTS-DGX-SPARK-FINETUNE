@@ -1,0 +1,10 @@
+{
+  "n_chunks": 134,
+  "total_min": 17.83,
+  "dropped_sec": 41.9,
+  "n_word_split": 0,
+  "n_hard_cut": 0,
+  "terminal_frac": 0.0,
+  "capital_frac": 0.0,
+  "median_words": 0.0
+}

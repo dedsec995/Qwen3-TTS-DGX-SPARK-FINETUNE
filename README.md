@@ -6,12 +6,13 @@ It uses flash attention 2 prebuilt wheels. If you want you can build them manual
 
 ## Features
 - **Simultaneous Multi-Speaker Training**: Train multiple voices together to prevent catastrophic forgetting and create a single shared-weight checkpoint.
-- **End-to-End Pipeline**: 24 kHz multi-speaker chunking with loudness normalization, punctuated NeMo Parakeet-TDT transcription, transcript quality filtering, speaker-conditioned prompt tagging, audio code extraction, and fine-tuning.
+- **Two-Level Sentence-Aware Audio Chunking**: Splits audio into ~20s transcription windows in silence, uses verbatim Parakeet-TDT ASR with word timestamps, and packs into 3–10s chunks cut cleanly on sentence boundaries (`.` `?` `!`).
+- **Verbatim ASR with Punctuation & Disfluency Preservation**: Uses `nvidia/parakeet-tdt-0.6b-v2` to capture speech disfluencies (`um`, `uh`, stutters) and true punctuation/casing, eliminating breathless and robotic monotone TTS delivery.
+- **Zero-Redundancy Pipeline**: `fine_tune_qwen.py` automatically reuses pre-computed transcripts from `chunks.jsonl`, skipping the 2.4 GB NeMo model loading entirely.
 - **Centroid Speaker Embeddings**: Each speaker's baked-in embedding is averaged over 64 clips rather than taken from a single reference, and the reference clip itself is auto-selected as the one nearest that centroid.
 - **Validation & Metrics**: Per-speaker stratified train/val split, eval loss every epoch, and TensorBoard logging of both losses and the learning rate.
 - **Dual-Inference Compatibility**: Supports both native `generate_custom_voice(speaker=...)` via registered `spk_id` slots and prompt-conditioned streaming inference (`"Speaker <name>: ..."`) for stacks like `faster-qwen3-tts`.
-- **ARM64 Native**: Uses NVIDIA NeMo Parakeet to bypass x86 limitations.
-- **Configurable Control**: Direct CLI controls for transcription batch size, training batch size, gradient accumulation, learning rate, weight decay, and checkpoint saving intervals.
+- **ARM64 Native**: Optimized for Grace Blackwell architectures.
 - **Local Caching**: Stores model weights inside the local `./env/hf_cache` rather than bloating the host OS.
 
 ## Requirements
@@ -66,8 +67,8 @@ raw_audio/
 
 ## Usage
 
-### 1. Chunk Your Audio
-TTS models require short audio segments (3–10 seconds). Run the chunking script; it automatically detects speaker subfolders and preserves the speaker hierarchy:
+### 1. Chunk Your Audio (Sentence-Aware)
+Run the chunking script; it detects speaker subfolders, transcribes ~20s windows in silence, and cuts chunks at natural sentence boundaries (`.` `?` `!`):
 
 ```bash
 python chunk_audio.py --input_dir ./raw_audio --output_dir ./audio_chunks
@@ -78,14 +79,15 @@ The resulting `./audio_chunks` structure:
 audio_chunks/
 ├── bob/
 │   ├── chunk_0000.wav
-│   └── chunk_0001.wav
+│   ├── chunk_0001.wav
+│   └── chunks.jsonl      <-- contains audio stats and verbatim transcripts
 └── alice/
     ├── chunk_0000.wav
-    └── chunk_0001.wav
+    └── chunks.jsonl
 ```
 
 ### 2. Fine-Tune the Multi-Speaker Model
-Run the end-to-end training pipeline. The script automatically discovers all speakers, conditions transcripts with `Speaker {name}: {text}`, extracts speaker embeddings, and trains the model:
+Run the end-to-end training pipeline. The script automatically discovers all speakers, loads pre-computed transcripts from `chunks.jsonl`, extracts speaker embeddings, and trains the model:
 
 ```bash
 python fine_tune_qwen.py \
@@ -95,7 +97,6 @@ python fine_tune_qwen.py \
     --save_every_n_epochs 2 \
     --lr 2e-6 \
     --batch_size 8 \
-    --transcribe_batch_size 8 \
     --gradient_accumulation_steps 4
 ```
 
@@ -111,12 +112,6 @@ After the run, check `output_multi/asr_report.json` (what the transcript filter 
 why) and `output_multi/speaker_meta.json`. In the latter, `mean_cos_to_centroid` below 0.80
 usually means chunks from another voice ended up in a speaker's folder; a clean
 single-session recording scores around 0.99.
-
-> **Reference audios are selected automatically** — for each speaker the pipeline picks the
-> chunk nearest that speaker's embedding centroid and freezes a copy under
-> `output_multi/references/`. You can override with `--ref_audio_dir ./references`, but note
-> the speaker encoder models content up to 12 kHz, so a reference below 24 kHz produces a
-> duller embedding; the pipeline warns if you supply one.
 
 ---
 
@@ -162,4 +157,3 @@ No. I have DGX Spark Grace Blackwell gb10 and I'll only include, it might work o
 
 ## License
 This project is released under the MIT License. See the LICENSE file for details.
-

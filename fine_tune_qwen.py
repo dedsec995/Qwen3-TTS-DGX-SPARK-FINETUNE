@@ -5,7 +5,7 @@ Qwen3-TTS One-Command Multi-Speaker Fine-Tuning Script
 
 End-to-end pipeline:
 1. Discover speakers from ./audio_chunks/<speaker>/ (or a flat dir for one speaker)
-2. Transcribe with NeMo Parakeet TDT (punctuated + capitalized)
+2. Load pre-computed transcripts from chunks.jsonl (or transcribe with NeMo Parakeet TDT if missing)
 3. Filter bad transcripts, write train_raw.jsonl
 4. Extract audio_codes -> train_with_codes.jsonl
 5. Fine-tune, with per-speaker centroid speaker embeddings baked into the checkpoint
@@ -53,7 +53,7 @@ import torchaudio
 from tqdm import tqdm
 
 # Signature version -- bump to force regeneration of cached jsonl files.
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 ALLOWED_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 .,?!'\"-:;()")
 
@@ -183,6 +183,7 @@ class Qwen3TTSPipeline:
         max_drop_frac: float = 0.20,
         seed: int = 1234,
         speaker_prefix_template: str = "Speaker {speaker}: {text}",
+        ignore_chunk_text: bool = False,
         force_retranscribe: bool = False,
         force_reencode: bool = False,
     ):
@@ -210,6 +211,7 @@ class Qwen3TTSPipeline:
         self.max_drop_frac = max_drop_frac
         self.seed = seed
         self.speaker_prefix_template = speaker_prefix_template
+        self.ignore_chunk_text = ignore_chunk_text
         self.force_retranscribe = force_retranscribe
         self.force_reencode = force_reencode
 
@@ -217,6 +219,7 @@ class Qwen3TTSPipeline:
         self.speaker_files: Dict[str, List[Path]] = {}
         self.speaker_ref_audios: Dict[str, Path] = {}
         self.manifest: Dict[str, dict] = {}
+        self.chunk_params: Dict[str, Any] = {}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.train_raw_jsonl = self.output_dir / "train_raw.jsonl"
@@ -240,8 +243,17 @@ class Qwen3TTSPipeline:
                 for line in f:
                     row = json.loads(line)
                     self.manifest[str(base / row["file"])] = row
+
+        for params_path in self.audio_dir.rglob("chunk_params.json"):
+            try:
+                self.chunk_params = json.loads(params_path.read_text())
+                break
+            except Exception:
+                pass
+
         if self.manifest:
-            print(f"Loaded chunk metadata for {len(self.manifest)} chunks")
+            n_text = sum(1 for r in self.manifest.values() if r.get("text"))
+            print(f"Loaded chunk metadata for {len(self.manifest)} chunks ({n_text} with pre-computed text)")
 
     def validate_audio_files(self) -> List[Path]:
         if not self.audio_dir.exists():
@@ -300,45 +312,74 @@ class Qwen3TTSPipeline:
     # ------------------------------------------------------------------ ASR
 
     def transcribe_audio(self, audio_files: List[Path]) -> List[Dict[str, Any]]:
-        import nemo.collections.asr as nemo_asr
-
-        print(f"\n{'='*60}\nSTEP 1: Transcribing with {self.asr_model}\n{'='*60}\n")
-
-        model = nemo_asr.models.ASRModel.from_pretrained(model_name=self.asr_model)
-        if self.device.startswith("cuda"):
-            model = model.cuda()
-        model.eval()
-
-        # The chunks are 24 kHz and the ASR wants 16 kHz, but NeMo resamples on read
-        # (AudioSegment.__init__ resamples whenever target_sr != sample_rate).
-        # Do NOT downsample the chunks to feed the ASR -- they are the training data.
-        paths = [str(p) for p in audio_files]
-        print(f"Transcribing {len(paths)} files...")
-        with torch.inference_mode():
-            transcripts = model.transcribe(paths, batch_size=self.transcribe_batch_size)
-        if isinstance(transcripts, tuple):
-            transcripts = transcripts[0]
-
         results = []
         shown = Counter()
-        for path, text in zip(audio_files, transcripts):
-            if hasattr(text, "text"):
-                text = text.text
-            spk = self._speaker_of(path)
-            results.append({
-                "audio": str(path),
-                "raw_text": text.strip(),
-                "speaker": spk,
-                "duration": self._duration_of(path),
-            })
-            if shown[spk] < 5:
-                print(f"  [{spk}] {path.name}: {text.strip()[:90]}")
-                shown[spk] += 1
+        todo = []
 
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        print(f"\nTranscribed {len(results)} files")
+        chunk_asr = self.chunk_params.get("asr_model")
+        if chunk_asr and chunk_asr != self.asr_model and not self.ignore_chunk_text:
+            print(f"  NOTE: Chunks were generated with ASR model '{chunk_asr}', but pipeline "
+                  f"is configured with '{self.asr_model}'. Using chunk transcripts. "
+                  f"Pass --ignore_chunk_text to force re-transcribing with {self.asr_model}.")
+
+        for path in audio_files:
+            spk = self._speaker_of(path)
+            row = self.manifest.get(str(path), {})
+            chunk_text = row.get("text")
+            if not self.ignore_chunk_text and chunk_text is not None and chunk_text.strip():
+                results.append({
+                    "audio": str(path),
+                    "raw_text": chunk_text.strip(),
+                    "speaker": spk,
+                    "duration": self._duration_of(path),
+                    "text_source": "chunk",
+                })
+                if shown[spk] < 5:
+                    print(f"  [{spk} - from chunk] {path.name}: {chunk_text.strip()[:90]}")
+                    shown[spk] += 1
+            else:
+                todo.append(path)
+
+        if todo:
+            import nemo.collections.asr as nemo_asr
+
+            print(f"\n{'='*60}\nSTEP 1: Transcribing {len(todo)} file(s) with {self.asr_model}\n{'='*60}\n")
+            model = nemo_asr.models.ASRModel.from_pretrained(model_name=self.asr_model)
+            if self.device.startswith("cuda"):
+                model = model.cuda()
+            model.eval()
+
+            paths = [str(p) for p in todo]
+            with torch.inference_mode():
+                transcripts = model.transcribe(paths, batch_size=self.transcribe_batch_size)
+            if isinstance(transcripts, tuple):
+                transcripts = transcripts[0]
+
+            for path, text in zip(todo, transcripts):
+                if hasattr(text, "text"):
+                    text = text.text
+                spk = self._speaker_of(path)
+                results.append({
+                    "audio": str(path),
+                    "raw_text": text.strip(),
+                    "speaker": spk,
+                    "duration": self._duration_of(path),
+                    "text_source": "asr",
+                })
+                if shown[spk] < 5:
+                    print(f"  [{spk} - from ASR] {path.name}: {text.strip()[:90]}")
+                    shown[spk] += 1
+
+            del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print(f"\nReused pre-computed transcripts for all {len(results)} chunks (NeMo load skipped)")
+
+        path_order = {str(p): i for i, p in enumerate(audio_files)}
+        results.sort(key=lambda r: path_order.get(r["audio"], 0))
+
+        print(f"\nProcessed {len(results)} files ({len(results) - len(todo)} reused, {len(todo)} transcribed)")
         return results
 
     def _duration_of(self, path: Path) -> float:
@@ -405,6 +446,12 @@ class Qwen3TTSPipeline:
             detail = ", ".join(f"{r}={c}" for r, c in sorted(s["reasons"].items())) or "none"
             print(f"  {spk}: kept {s['kept']}/{s['total']} ({s['secs']/60:.1f} min) "
                   f"| dropped {frac*100:.1f}% [{detail}]")
+
+        valid_texts = [r["raw_text"] for r in kept if r.get("raw_text")]
+        if valid_texts:
+            term_frac = sum(bool(t.strip() and t.strip()[-1] in ".?!") for t in valid_texts) / len(valid_texts)
+            cap_frac = sum(bool(t.strip() and t.strip()[0].isupper()) for t in valid_texts) / len(valid_texts)
+            print(f"  Sentence quality: terminal {term_frac*100:.1f}% | capital {cap_frac*100:.1f}%")
 
         report = self.output_dir / "asr_report.json"
         with open(report, "w", encoding="utf-8") as f:
@@ -513,11 +560,6 @@ class Qwen3TTSPipeline:
     def compute_centroid_embedding(self, speaker, clips, model, device, dtype):
         """Mean speaker-encoder embedding over up to `centroid_clips` clips,
         rescaled to the median per-clip norm.
-
-        Averaging vectors that mutually agree at only ~0.7 cosine shrinks the norm
-        by roughly sqrt((1 + (k-1)*0.7)/k). Since this vector is written straight
-        into codec_embedding.weight[spk_id], where magnitude is semantically
-        meaningful, we restore the magnitude the talker expects.
         """
         clips = sorted(clips)
         rng = random.Random(self.seed)
@@ -557,8 +599,6 @@ class Qwen3TTSPipeline:
     def create_train_jsonl(self, kept: List[dict]) -> None:
         print(f"\n{'='*60}\nSTEP 2: Writing train_raw.jsonl\n{'='*60}\n")
 
-        # Provisional reference per speaker (metadata gate only, no model needed).
-        # train_model() upgrades this to the centroid-nearest clip.
         for spk in self.speakers:
             override = self._resolve_ref_override(spk)
             if override is not None:
@@ -623,17 +663,29 @@ class Qwen3TTSPipeline:
         for p in sorted(self.audio_dir.rglob("*.wav")):
             st = p.stat()
             entries.append(f"{p.relative_to(self.audio_dir)}:{st.st_size}:{st.st_mtime_ns}")
+        for chunks in sorted(self.audio_dir.rglob("chunks.jsonl")):
+            entries.append(f"chunks:{chunks.read_text()}")
         for params in sorted(self.audio_dir.rglob("chunk_params.json")):
             entries.append(params.read_text())
         return hashlib.sha1("\n".join(entries).encode()).hexdigest()
 
     def _raw_signature(self) -> dict:
+        n_with_text = sum(1 for r in self.manifest.values() if r.get("text"))
+        if self.ignore_chunk_text or n_with_text == 0:
+            chunk_text_mode = "asr"
+        elif n_with_text == len(self.manifest):
+            chunk_text_mode = "reuse"
+        else:
+            chunk_text_mode = "mixed"
+
         sig = {
             "version": PIPELINE_VERSION,
             "speakers": self.speakers,
             "prefix_template": self.speaker_prefix_template or "",
             "asr_model": self.asr_model,
             "max_drop_frac": self.max_drop_frac,
+            "chunk_text_mode": chunk_text_mode,
+            "ignore_chunk_text": self.ignore_chunk_text,
             "audio_fingerprint": self._audio_fingerprint(),
         }
         sig["hash"] = hashlib.sha1(json.dumps(sig, sort_keys=True).encode()).hexdigest()
@@ -670,7 +722,7 @@ class Qwen3TTSPipeline:
             if stored.get(k) != current.get(k):
                 a, b = stored.get(k), current.get(k)
                 if k == "audio_fingerprint":
-                    diffs.append("audio files changed")
+                    diffs.append("audio files or chunk manifests changed")
                 else:
                     diffs.append(f"{k}: {a!r} -> {b!r}")
         return "; ".join(diffs) or "unknown change"
@@ -707,9 +759,6 @@ class Qwen3TTSPipeline:
             torch_dtype=self.torch_dtype,
             attn_implementation=self.attn_implementation,
         )
-        # Load the config class directly: qwen_tts only registers 'qwen3_tts' with
-        # AutoConfig as a side effect of Qwen3TTSModel.from_pretrained, so AutoConfig
-        # here would depend on call ordering.
         config = Qwen3TTSConfig.from_pretrained(self.init_model_path)
 
         rows = [json.loads(line) for line in open(self.train_with_codes_jsonl, encoding="utf-8")]
@@ -719,11 +768,7 @@ class Qwen3TTSPipeline:
         for r in rows:
             by_speaker.setdefault(r.get("speaker", self.speaker_name), []).append(r)
 
-        # The speaker encoder is used only to produce conditioning; its weights are
-        # dropped at save time, so training them would be a silent train/save mismatch.
         qwen3tts.model.speaker_encoder.requires_grad_(False)
-        # Centroids are computed before accelerator.prepare (the chosen reference
-        # feeds ref_audio, which the dataset needs), so move the encoder explicitly.
         qwen3tts.model.speaker_encoder.to(accelerator.device)
 
         print(f"\nComputing centroid speaker embeddings ({self.centroid_clips} clips max)...")
@@ -751,9 +796,6 @@ class Qwen3TTSPipeline:
         with open(self.output_dir / "speaker_meta.json", "w", encoding="utf-8") as f:
             json.dump(speaker_meta, f, indent=2)
 
-        # One fixed reference per speaker, as the upstream finetuning README asks for.
-        # audio_codes derive from item["audio"], never ref_audio, so this is safe to
-        # patch in place without re-encoding.
         for r in rows:
             r["ref_audio"] = str(self.speaker_ref_audios[r.get("speaker", self.speaker_name)])
 
@@ -915,8 +957,8 @@ class Qwen3TTSPipeline:
             cfg = json.load(f)
         cfg["tts_model_type"] = "custom_voice"
         talker_cfg = cfg.get("talker_config", {})
-        talker_cfg["spk_id"] = {spk: 3000 + i for i, spk in enumerate(self.speakers)}
-        talker_cfg["spk_is_dialect"] = {spk: False for spk in self.speakers}
+        talker_cfg["spk_id"] = {spk.lower(): 3000 + i for i, spk in enumerate(self.speakers)}
+        talker_cfg["spk_is_dialect"] = {spk.lower(): False for spk in self.speakers}
         cfg["talker_config"] = talker_cfg
         with open(os.path.join(out_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -999,8 +1041,7 @@ def main():
     p.add_argument("--tokenizer_model_path", type=str, default="Qwen/Qwen3-TTS-Tokenizer-12Hz")
     p.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
     p.add_argument("--asr_model", type=str, default="nvidia/parakeet-tdt-0.6b-v2",
-                   help="NeMo ASR model. TDT variants emit punctuation and capitalization; "
-                        "parakeet-rnnt-1.1b does not.")
+                   help="NeMo ASR model with punctuation and capitalization support.")
 
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--transcribe_batch_size", type=int, default=4)
@@ -1020,6 +1061,8 @@ def main():
     p.add_argument("--max_drop_frac", type=float, default=0.20,
                    help="Fail if any speaker loses more than this fraction to the filter")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--ignore_chunk_text", action="store_true",
+                   help="Ignore pre-computed transcripts in chunks.jsonl and force ASR pass")
     p.add_argument("--force_retranscribe", action="store_true")
     p.add_argument("--force_reencode", action="store_true")
 
@@ -1038,7 +1081,8 @@ def main():
         sub_talker_loss_weight=args.sub_talker_loss_weight, val_frac=args.val_frac,
         num_workers=args.num_workers, centroid_clips=args.centroid_clips,
         max_drop_frac=args.max_drop_frac, seed=args.seed, speaker_prefix_template=template,
-        force_retranscribe=args.force_retranscribe, force_reencode=args.force_reencode,
+        ignore_chunk_text=args.ignore_chunk_text, force_retranscribe=args.force_retranscribe,
+        force_reencode=args.force_reencode,
     ).run()
 
 

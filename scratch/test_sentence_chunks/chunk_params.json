@@ -1,0 +1,19 @@
+{
+  "version": 3,
+  "sample_rate": 24000,
+  "sentence_aware": true,
+  "asr_model": "nvidia/parakeet-tdt-0.6b-v2",
+  "asr_window_sec": 20.0,
+  "target_dbfs": -23.0,
+  "peak_ceiling_dbfs": -1.0,
+  "silence_offset_db": 25.0,
+  "min_silence_ms": 400,
+  "merge_gap_ms": 1400,
+  "segment_gap_ms": 1400,
+  "orphan_gap_ms": 3000,
+  "snap_ms": 300,
+  "pad_ms": 200,
+  "seek_step_ms": 10,
+  "min_length_sec": 3.0,
+  "max_length_sec": 10.0
+}

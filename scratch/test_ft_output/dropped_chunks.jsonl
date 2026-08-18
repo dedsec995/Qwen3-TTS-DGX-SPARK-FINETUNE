@@ -1,5 +1,0 @@
-{"audio": "scratch/test_sentence_chunks/bert/chunk_0057.wav", "raw_text": "And um yeah, so yeah, more more more more visualization.", "speaker": "bert", "duration": 4.32, "text_source": "chunk", "reason": "repetition"}
-{"audio": "scratch/test_sentence_chunks/bert/chunk_0163.wav", "raw_text": "at 'cause of the the amount of price um difference between the the the predicted value and the", "speaker": "bert", "duration": 8.16, "text_source": "chunk", "reason": "repetition"}
-{"audio": "scratch/test_sentence_chunks/shiv/chunk_0046.wav", "raw_text": "Yeah. Like you you you you made me to continue the composition.", "speaker": "shiv", "duration": 4.92, "text_source": "chunk", "reason": "repetition"}
-{"audio": "scratch/test_sentence_chunks/shiv/chunk_0076.wav", "raw_text": "um So", "speaker": "shiv", "duration": 7.25, "text_source": "chunk", "reason": "rate_low"}
-{"audio": "scratch/test_sentence_chunks/shiv/chunk_0097.wav", "raw_text": "Whereas our smart platform, it it it does the automation health monitoring.", "speaker": "shiv", "duration": 7.885, "text_source": "chunk", "reason": "repetition"}

@@ -6,7 +6,9 @@ It uses flash attention 2 prebuilt wheels. If you want you can build them manual
 
 ## Features
 - **Simultaneous Multi-Speaker Training**: Train multiple voices together to prevent catastrophic forgetting and create a single shared-weight checkpoint.
-- **End-to-End Pipeline**: Automatically handles multi-speaker chunking, NeMo Parakeet transcription, speaker-conditioned prompt tagging, audio code extraction, and fine-tuning.
+- **End-to-End Pipeline**: 24 kHz multi-speaker chunking with loudness normalization, punctuated NeMo Parakeet-TDT transcription, transcript quality filtering, speaker-conditioned prompt tagging, audio code extraction, and fine-tuning.
+- **Centroid Speaker Embeddings**: Each speaker's baked-in embedding is averaged over 64 clips rather than taken from a single reference, and the reference clip itself is auto-selected as the one nearest that centroid.
+- **Validation & Metrics**: Per-speaker stratified train/val split, eval loss every epoch, and TensorBoard logging of both losses and the learning rate.
 - **Dual-Inference Compatibility**: Supports both native `generate_custom_voice(speaker=...)` via registered `spk_id` slots and prompt-conditioned streaming inference (`"Speaker <name>: ..."`) for stacks like `faster-qwen3-tts`.
 - **ARM64 Native**: Uses NVIDIA NeMo Parakeet to bypass x86 limitations.
 - **Configurable Control**: Direct CLI controls for transcription batch size, training batch size, gradient accumulation, learning rate, weight decay, and checkpoint saving intervals.
@@ -88,16 +90,33 @@ Run the end-to-end training pipeline. The script automatically discovers all spe
 ```bash
 python fine_tune_qwen.py \
     --audio_dir ./audio_chunks \
-    --output_dir ./output_multi_speaker \
-    --num_epochs 24 \
-    --save_every_n_epochs 6 \
-    --lr 3e-6 \
-    --batch_size 12 \
+    --output_dir ./output_multi \
+    --num_epochs 10 \
+    --save_every_n_epochs 2 \
+    --lr 2e-6 \
+    --batch_size 8 \
     --transcribe_batch_size 8 \
     --gradient_accumulation_steps 4
 ```
 
-> **Optional per-speaker reference audios**: If you have clean dedicated reference clips for each speaker (e.g. `references/bob.wav`, `references/alice.wav`), supply `--ref_audio_dir ./references`. Otherwise, the pipeline automatically extracts target embeddings from the speaker's audio chunks.
+Defaults follow the upstream Qwen recipe. Learning rates above ~1e-5 degrade speaker
+quality on small datasets, and over-training (24+ epochs on under an hour of audio) causes
+catastrophic forgetting and robotic output — watch the eval loss instead:
+
+```bash
+tensorboard --logdir ./output_multi/logs
+```
+
+After the run, check `output_multi/asr_report.json` (what the transcript filter dropped and
+why) and `output_multi/speaker_meta.json`. In the latter, `mean_cos_to_centroid` below 0.80
+usually means chunks from another voice ended up in a speaker's folder; a clean
+single-session recording scores around 0.99.
+
+> **Reference audios are selected automatically** — for each speaker the pipeline picks the
+> chunk nearest that speaker's embedding centroid and freezes a copy under
+> `output_multi/references/`. You can override with `--ref_audio_dir ./references`, but note
+> the speaker encoder models content up to 12 kHz, so a reference below 24 kHz produces a
+> duller embedding; the pipeline warns if you supply one.
 
 ---
 
@@ -107,10 +126,18 @@ Use the multi-speaker testing script to synthesize speech for all trained voices
 
 ```bash
 python test_models.py \
-    --checkpoint_path ./output_multi_speaker/checkpoint-epoch-23 \
+    --checkpoint_path ./output_multi/checkpoint-epoch-9 \
     --text "Hello! This is a test of our unified multi-speaker fine-tuned model." \
     --output_dir ./test_outputs
 ```
+
+Generation uses `language="auto"` by default, which is required: with an explicit language
+the model prepends a language token and the speaker embedding moves from sequence position
+6 to 7, which is not where training put it.
+
+A fine-tuned checkpoint is saved as `tts_model_type="custom_voice"`, so the library sets
+`speaker_encoder=None` on load and zero-shot `generate_voice_clone` is unavailable on it —
+use the base model for zero-shot cloning. `test_models.py` detects this and skips that step.
 
 #### Streaming Inference with `faster-qwen3-tts`
 Because speakers are conditioned directly in the text representation, you can switch voices dynamically during streaming simply by prepending the speaker tag:
@@ -131,6 +158,7 @@ No. I have DGX Spark Grace Blackwell gb10 and I'll only include, it might work o
 - **Alibaba Qwen Team**: For releasing the open-source [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) models.
 - **sruckh**: For the [Qwen3-TTS-finetune](https://github.com/sruckh/Qwen3-TTS-finetune) repository, whose training loop and `dataset.py` formed the baseline of this project.
 - **NVIDIA NeMo Team**: For the Parakeet-TDT ASR models.
+- **Baseten**: For their Qwen3-TTS fine-tuning writeup, source of the centroid speaker-embedding approach.
 
 ## License
 This project is released under the MIT License. See the LICENSE file for details.

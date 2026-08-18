@@ -2,6 +2,7 @@ audio_chunks
 output*
 raw_audio/*
 reference.wav
+references/*
 
 # Project-specific
 CLAUDE.md

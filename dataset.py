@@ -31,14 +31,41 @@ AudioLike = Union[
 MaybeList = Union[Any, List[Any]]
 
 class TTSDataset(Dataset):
-    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1):
+    def __init__(self, data_list, processor, config:Qwen3TTSConfig, lag_num = -1,
+                 cache_ref_mels = True, max_cached_refs = 2000):
         self.data_list = data_list
         self.processor = processor
         self.lag_num = lag_num
         self.config = config
 
+        # With one fixed ref_audio per speaker there are only a handful of distinct
+        # reference clips, so caching their mels turns __getitem__ into a dict lookup
+        # instead of a librosa load + resample + mel per sample per epoch.
+        self._ref_mel_cache = {}
+        self._text_ids_cache = {}
+        if cache_ref_mels:
+            unique_refs = {item['ref_audio'] for item in data_list
+                           if isinstance(item.get('ref_audio'), str)}
+            if len(unique_refs) <= max_cached_refs:
+                for ref_path in sorted(unique_refs):
+                    self._ref_mel_cache[ref_path] = self._compute_ref_mel(ref_path)
+
+        # The processor call is not free and is pure per-item recomputation across epochs.
+        for item in data_list:
+            text = self._build_assistant_text(item['text'])
+            if text not in self._text_ids_cache:
+                self._text_ids_cache[text] = self._tokenize_texts(text)
+
     def __len__(self):
         return len(self.data_list)
+
+    def _compute_ref_mel(self, ref_audio_path):
+        normalized = self._normalize_audio_inputs(self._ensure_list(ref_audio_path))
+        wav, sr = normalized[0]
+        if sr != 24000:
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=24000)
+            sr = 24000
+        return self.extract_mels(audio=wav, sr=sr)
 
     def _load_audio_to_np(self, x: str) -> Tuple[np.ndarray, int]:
 
@@ -120,28 +147,19 @@ class TTSDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data_list[idx]
 
-        audio_path  = item["audio"]
-        text        = item["text"]
         audio_codes = item["audio_codes"]
-        language        = item.get('language','Auto')
         ref_audio_path  = item['ref_audio']
 
-        text = self._build_assistant_text(text)
-        text_ids = self._tokenize_texts(text)
+        text = self._build_assistant_text(item["text"])
+        text_ids = self._text_ids_cache.get(text)
+        if text_ids is None:
+            text_ids = self._tokenize_texts(text)
 
         audio_codes = torch.tensor(audio_codes, dtype=torch.long)
 
-        ref_audio_list = self._ensure_list(ref_audio_path)
-        normalized = self._normalize_audio_inputs(ref_audio_list)
-        wav, sr = normalized[0]
-
-        # Resample to 24kHz if needed
-        if sr != 24000:
-            import librosa
-            wav = librosa.resample(wav, orig_sr=sr, target_sr=24000)
-            sr = 24000
-
-        ref_mel = self.extract_mels(audio=wav, sr=sr)
+        ref_mel = self._ref_mel_cache.get(ref_audio_path)
+        if ref_mel is None:
+            ref_mel = self._compute_ref_mel(ref_audio_path)
 
         return {
             "text_ids": text_ids[:,:-5],    # 1 , t

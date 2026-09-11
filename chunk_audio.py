@@ -76,13 +76,30 @@ def normalize_loudness(audio, target_dbfs=-23.0, peak_ceiling_dbfs=-1.0):
     return audio.apply_gain(gain), gain, clamped, stats
 
 
+def _capitalize_first_alpha(text: str) -> str:
+    """Ensure the first alphabetical character in the text is uppercase."""
+    for i, ch in enumerate(text):
+        if ch.isalpha():
+            if ch.isupper():
+                return text
+            return text[:i] + ch.upper() + text[i + 1:]
+    return text
+
+
 def sentence_stats(texts):
     """Calculate terminal punctuation, capitalization, and median word count."""
     valid = [t.strip() for t in texts if t and t.strip()]
     if not valid:
         return {"terminal_frac": 0.0, "capital_frac": 0.0, "median_words": 0.0}
     term = sum(bool(t[-1] in ".?!") for t in valid)
-    cap = sum(bool(t[0].isupper()) for t in valid)
+    cap = 0
+    for t in valid:
+        words = t.split()
+        if not words:
+            continue
+        first_token = words[0].strip("\"'“‘([")
+        if first_token and (first_token[0].isupper() or first_token[0].isdigit()):
+            cap += 1
     word_counts = [len(t.split()) for t in valid]
     med_w = float(np.median(word_counts)) if word_counts else 0.0
     return {
@@ -182,41 +199,104 @@ def load_asr_model(asr_model_name: str, device: str = "cuda:0"):
     return model
 
 
-def _snap_to_silence(start_ms, end_ms, silence_ranges, snap_ms=300):
-    """Snap start and end timestamps to nearest nonsilent edges within snap_ms."""
-    if not silence_ranges or snap_ms <= 0:
-        return start_ms, end_ms
-
-    snapped_start = start_ms
-    best_start_diff = snap_ms + 1
-    for s, e in silence_ranges:
-        diff = abs(s - start_ms)
-        if diff <= snap_ms and diff < best_start_diff:
-            best_start_diff = diff
-            snapped_start = s
-
-    snapped_end = end_ms
-    best_end_diff = snap_ms + 1
-    for s, e in silence_ranges:
-        diff = abs(e - end_ms)
-        if diff <= snap_ms and diff < best_end_diff:
-            best_end_diff = diff
-            snapped_end = e
-
-    if snapped_end > snapped_start:
-        return snapped_start, snapped_end
-    return start_ms, end_ms
+def _snap_to_zero_crossing(samples, target_idx, search_radius=240):
+    """Snap target_idx to the nearest zero-crossing within search_radius samples."""
+    lo = max(0, target_idx - search_radius)
+    hi = min(len(samples) - 1, target_idx + search_radius)
+    if hi <= lo:
+        return target_idx
+    window = samples[lo:hi]
+    signs = np.signbit(window)
+    crossings = np.where(signs[:-1] != signs[1:])[0]
+    if len(crossings) == 0:
+        return lo + int(np.argmin(np.abs(window)))
+    best_c = min(crossings, key=lambda c: abs((lo + c) - target_idx))
+    return lo + int(best_c)
 
 
-def _split_segment(seg, max_ms):
-    """Split one sentence or word group if it exceeds max_ms."""
+def _find_acoustic_boundary_ms(
+    samples,
+    target_ms,
+    search_left_ms,
+    search_right_ms,
+    is_end=True,
+    frame_ms=10,
+    sample_rate=TARGET_SR,
+):
+    """Find the quietest acoustic frame (energy valley) and snap to zero-crossing."""
+    search_left_ms = max(0, search_left_ms)
+    search_right_ms = max(search_left_ms, search_right_ms)
+    if search_right_ms <= search_left_ms:
+        return target_ms
+
+    left_idx = int(search_left_ms * sample_rate / 1000)
+    right_idx = int(search_right_ms * sample_rate / 1000)
+    target_idx = int(target_ms * sample_rate / 1000)
+    frame_len = max(1, int(sample_rate * frame_ms / 1000))
+    hop_len = max(1, frame_len // 2)
+
+    window = samples[left_idx:right_idx]
+    if len(window) < frame_len * 2:
+        snapped_sample = _snap_to_zero_crossing(samples, target_idx)
+        return int(round(snapped_sample * 1000.0 / sample_rate))
+
+    n_frames = (len(window) - frame_len) // hop_len + 1
+    frames = np.lib.stride_tricks.sliding_window_view(window, frame_len)[::hop_len]
+    energies = np.mean(frames ** 2, axis=1)
+
+    if is_end:
+        # For end boundary, give preference to frames 40-120ms after target_ms to capture vocal decay
+        target_frame_idx = max(0, int((target_idx - left_idx) / hop_len))
+        decay_bonus = np.zeros_like(energies)
+        min_decay_frames = int(40 * sample_rate / 1000 / hop_len)
+        decay_bonus[: min(len(decay_bonus), target_frame_idx + min_decay_frames)] += 1e-4
+        best_frame = int(np.argmin(energies + decay_bonus))
+    else:
+        best_frame = int(np.argmin(energies))
+
+    best_sample = left_idx + best_frame * hop_len + frame_len // 2
+    snapped_sample = _snap_to_zero_crossing(samples, best_sample)
+    return int(round(snapped_sample * 1000.0 / sample_rate))
+
+
+def apply_micro_fade(audio_chunk, fade_ms=10):
+    """Apply smooth micro-fade to chunk edges to prevent boundary clicks."""
+    if len(audio_chunk) < fade_ms * 2:
+        return audio_chunk
+    return audio_chunk.fade_in(fade_ms).fade_out(fade_ms)
+
+
+def _split_sentence_at_clause_or_pause(
+    seg,
+    min_ms,
+    max_ms,
+    clause_min_pause_ms=120,
+    silence_min_pause_ms=250,
+    drop_unsplit_oversized=True,
+):
+    """Split an oversized sentence at natural clause boundaries or acoustic pauses.
+
+    Hierarchy of candidate split points:
+    1. Major clause punctuation (;, :, --, ...) or comma (,) with pause >= clause_min_pause_ms.
+    2. Discourse conjunction (and, but, because, so, which, etc.) with pause >= clause_min_pause_ms.
+    3. Comma with any pause >= 50ms.
+    4. Unpunctuated acoustic silence valley >= silence_min_pause_ms.
+
+    If no valid pause/clause exists:
+    - If drop_unsplit_oversized: returns [] (drops run-on to prevent prosody corruption).
+    - Else: falls back to midpoint cut.
+
+    Splits normalize text: left fragment receives terminal '.', right fragment is capitalized.
+    """
     start, end = seg["start_ms"], seg["end_ms"]
-    if end - start <= max_ms:
+    dur = end - start
+    if dur <= max_ms:
         return [seg]
 
     words = seg.get("words", [])
     if len(words) < 2:
-        # Cannot split at word boundaries -- hard cut by time
+        if drop_unsplit_oversized:
+            return []
         spans = []
         pos = start
         while pos < end:
@@ -231,30 +311,105 @@ def _split_segment(seg, max_ms):
             pos += max_ms
         return spans
 
-    mid = (start + end) / 2.0
-    best_i = min(
-        range(len(words) - 1),
-        key=lambda i: abs(((words[i]["end_ms"] + words[i + 1]["start_ms"]) / 2.0) - mid),
+    CONJUNCTIONS = (
+        "and", "but", "because", "so", "which", "although", "however",
+        "whereas", "while", "then", "since", "yet", "or",
     )
+
+    candidates = []
+    mid = (start + end) / 2.0
+
+    for i in range(len(words) - 1):
+        w_left = words[i]
+        w_right = words[i + 1]
+        left_dur = w_left["end_ms"] - start
+        right_dur = end - w_right["start_ms"]
+
+        if left_dur < min_ms or left_dur > max_ms:
+            continue
+        if right_dur < min_ms and right_dur < max_ms:
+            continue
+
+        pause_ms = max(0, w_right["start_ms"] - w_left["end_ms"])
+        token_left = w_left["word"].strip()
+        token_right = w_right["word"].strip().lower().strip(".,?!\"'")
+
+        score = 0
+        split_type = "none"
+
+        # Tier 1: Major clause punctuation or comma with pause
+        if token_left and (token_left[-1] in ";:—–" or token_left.endswith("--") or token_left.endswith("...")):
+            score = 1000 + min(pause_ms, 500)
+            split_type = "major_punct"
+        elif token_left and token_left[-1] == "," and pause_ms >= clause_min_pause_ms:
+            score = 850 + min(pause_ms, 500)
+            split_type = "comma_pause"
+        # Tier 2: Discourse conjunction with acoustic pause
+        elif token_right in CONJUNCTIONS and pause_ms >= clause_min_pause_ms:
+            score = 700 + min(pause_ms, 500)
+            split_type = "conjunction_pause"
+        # Tier 3: Comma with minor pause
+        elif token_left and token_left[-1] == "," and pause_ms >= 50:
+            score = 550 + min(pause_ms, 500)
+            split_type = "comma_minor"
+        # Tier 4: Significant acoustic pause without punctuation
+        elif pause_ms >= silence_min_pause_ms:
+            score = 450 + min(pause_ms, 500)
+            split_type = "acoustic_pause"
+
+        if score > 0:
+            dist_mid = abs(((w_left["end_ms"] + w_right["start_ms"]) / 2.0) - mid)
+            adj_score = score - (dist_mid / 50.0)
+            candidates.append((adj_score, i, split_type))
+
+    if not candidates:
+        if drop_unsplit_oversized:
+            return []
+        best_i = min(
+            range(len(words) - 1),
+            key=lambda i: abs(((words[i]["end_ms"] + words[i + 1]["start_ms"]) / 2.0) - mid),
+        )
+    else:
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        best_i = candidates[0][1]
 
     left_words = words[: best_i + 1]
     right_words = words[best_i + 1 :]
 
+    # Normalize left text (must end in terminal punctuation)
+    left_raw = " ".join(w["word"] for w in left_words).strip()
+    if left_raw:
+        if left_raw[-1] in ",;:":
+            left_raw = left_raw[:-1] + "."
+        elif left_raw[-1] not in ".?!":
+            left_raw = left_raw + "."
+
+    # Normalize right text (must start with capitalized letter)
+    right_raw = " ".join(w["word"] for w in right_words).strip()
+    if right_raw:
+        right_raw = right_raw[0].upper() + right_raw[1:]
+
     left_seg = {
         "start_ms": left_words[0]["start_ms"],
         "end_ms": left_words[-1]["end_ms"],
-        "text": " ".join(w["word"] for w in left_words).strip(),
+        "text": left_raw,
         "words": left_words,
-        "word_split": True,
+        "clause_split": True,
     }
     right_seg = {
         "start_ms": right_words[0]["start_ms"],
         "end_ms": right_words[-1]["end_ms"],
-        "text": " ".join(w["word"] for w in right_words).strip(),
+        "text": right_raw,
         "words": right_words,
-        "word_split": True,
+        "clause_split": True,
     }
-    return _split_segment(left_seg, max_ms) + _split_segment(right_seg, max_ms)
+
+    right_results = _split_sentence_at_clause_or_pause(
+        right_seg, min_ms, max_ms, clause_min_pause_ms, silence_min_pause_ms, drop_unsplit_oversized
+    )
+    if not right_results and drop_unsplit_oversized:
+        return [left_seg]
+    return [left_seg] + right_results
 
 
 def pack_segments(
@@ -265,13 +420,14 @@ def pack_segments(
     pad_ms,
     segment_gap_ms,
     orphan_gap_ms,
-    silence_ranges=None,
-    snap_ms=300,
+    clause_min_pause_ms=120,
+    silence_min_pause_ms=250,
+    drop_unsplit_oversized=True,
 ):
-    """Pack sentences into training chunks.
+    """Pack sentences into training chunks using clause-aware boundaries.
 
     Returns (kept_chunks, dropped_spans).
-    Each item in kept_chunks is a dict with start_ms, end_ms, text, n_segments, word_split, hard_cut.
+    Each item in kept_chunks is a dict with start_ms, end_ms, text, n_segments, clause_split, hard_cut.
     """
     if not segments:
         return [], []
@@ -293,6 +449,7 @@ def pack_segments(
 
     # 2. Split any group or single sentence that exceeds max_ms
     spans = []
+    dropped_spans = []
     for group in groups:
         grp_start = group[0]["start_ms"]
         grp_end = group[-1]["end_ms"]
@@ -309,7 +466,7 @@ def pack_segments(
                 "text": grp_text,
                 "words": all_words,
                 "n_segments": len(group),
-                "word_split": False,
+                "clause_split": any(s.get("clause_split", False) for s in group),
                 "hard_cut": False,
             })
         else:
@@ -319,45 +476,40 @@ def pack_segments(
                     range(len(group) - 1),
                     key=lambda i: abs(((group[i]["end_ms"] + group[i + 1]["start_ms"]) / 2.0) - mid),
                 )
-                left_k, _ = pack_segments(
-                    group[: best_i + 1], total_ms, min_ms, max_ms, 0, segment_gap_ms, orphan_gap_ms, silence_ranges, 0
+                left_k, left_d = pack_segments(
+                    group[: best_i + 1], total_ms, min_ms, max_ms, pad_ms, segment_gap_ms, orphan_gap_ms,
+                    clause_min_pause_ms, silence_min_pause_ms, drop_unsplit_oversized
                 )
-                right_k, _ = pack_segments(
-                    group[best_i + 1 :], total_ms, min_ms, max_ms, 0, segment_gap_ms, orphan_gap_ms, silence_ranges, 0
+                right_k, right_d = pack_segments(
+                    group[best_i + 1 :], total_ms, min_ms, max_ms, pad_ms, segment_gap_ms, orphan_gap_ms,
+                    clause_min_pause_ms, silence_min_pause_ms, drop_unsplit_oversized
                 )
                 spans.extend(left_k)
                 spans.extend(right_k)
+                dropped_spans.extend(left_d)
+                dropped_spans.extend(right_d)
             else:
-                split_segs = _split_segment(group[0], max_ms)
-                for s in split_segs:
-                    s["n_segments"] = 1
-                    spans.append(s)
+                split_segs = _split_sentence_at_clause_or_pause(
+                    group[0], min_ms, max_ms, clause_min_pause_ms, silence_min_pause_ms, drop_unsplit_oversized
+                )
+                if not split_segs:
+                    dropped_spans.append((grp_start, grp_end))
+                else:
+                    for s in split_segs:
+                        s["n_segments"] = 1
+                        spans.append(s)
 
-    # 3. Snap to silence edges
-    snapped_items = []
+    # 3. Filter spans: must satisfy min_ms <= dur <= max_ms
+    kept_chunks = []
     for s in spans:
-        sn_start, sn_end = _snap_to_silence(s["start_ms"], s["end_ms"], silence_ranges, snap_ms)
-        s["start_ms"] = sn_start
-        s["end_ms"] = sn_end
-        snapped_items.append((s["start_ms"], s["end_ms"], s))
+        dur = s["end_ms"] - s["start_ms"]
+        if dur >= min_ms:
+            kept_chunks.append(s)
+        else:
+            dropped_spans.append((s["start_ms"], s["end_ms"]))
 
-    # 4. Drop below min_ms and pad
-    padded, dropped = _drop_and_pad(snapped_items, total_ms, min_ms, pad_ms)
-
-    kept_results = []
-    for pad_start, pad_end, item in padded:
-        orig = item[2]
-        kept_results.append({
-            "start_ms": int(pad_start),
-            "end_ms": int(pad_end),
-            "text": orig.get("text"),
-            "n_segments": orig.get("n_segments", 1),
-            "word_split": orig.get("word_split", False),
-            "hard_cut": orig.get("hard_cut", False),
-        })
-
-    dropped_spans = [(d[0], d[1]) for d in dropped]
-    return kept_results, dropped_spans
+    kept_chunks.sort(key=lambda s: s["start_ms"])
+    return kept_chunks, dropped_spans
 
 
 def transcribe_windows_and_build_sentences(audio_file, audio_24k, ranges, asr_model, args):
@@ -458,21 +610,28 @@ def transcribe_windows_and_build_sentences(audio_file, audio_24k, ranges, asr_mo
         curr_sentence.append(w)
         word_token = w["word"].strip()
         if word_token and word_token[-1] in ".?!":
+            sent_text = _capitalize_first_alpha(" ".join(cw["word"] for cw in curr_sentence).strip())
             sentences.append({
                 "start_ms": curr_sentence[0]["start_ms"],
                 "end_ms": curr_sentence[-1]["end_ms"],
-                "text": " ".join(cw["word"] for cw in curr_sentence).strip(),
+                "text": sent_text,
                 "words": list(curr_sentence),
             })
             curr_sentence = []
 
     if curr_sentence:
-        sentences.append({
-            "start_ms": curr_sentence[0]["start_ms"],
-            "end_ms": curr_sentence[-1]["end_ms"],
-            "text": " ".join(cw["word"] for cw in curr_sentence).strip(),
-            "words": list(curr_sentence),
-        })
+        raw_text = " ".join(cw["word"] for cw in curr_sentence).strip()
+        if len(curr_sentence) >= 2 and raw_text:
+            if raw_text[-1] in ",;:":
+                raw_text = raw_text[:-1] + "."
+            elif raw_text[-1] not in ".?!":
+                raw_text = raw_text + "."
+            sentences.append({
+                "start_ms": curr_sentence[0]["start_ms"],
+                "end_ms": curr_sentence[-1]["end_ms"],
+                "text": _capitalize_first_alpha(raw_text),
+                "words": list(curr_sentence),
+            })
 
     return sentences
 
@@ -489,7 +648,7 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
     manifest = []
     chunk_counter = 0
     total_dropped_ms = 0
-    n_word_split = 0
+    n_clause_split = 0
     n_hard_cut = 0
 
     for audio_file in audio_files:
@@ -532,6 +691,8 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
             print(f"    WARNING: No speech detected in {audio_file.name}")
             continue
 
+        samples_24k = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float32) / 32768.0
+
         if not args.no_sentence_aware and asr_model is not None:
             sentences = transcribe_windows_and_build_sentences(
                 audio_file, audio, ranges, asr_model, args
@@ -544,20 +705,49 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
                 args.pad_ms,
                 args.segment_gap_ms,
                 args.orphan_gap_ms,
-                silence_ranges=ranges,
-                snap_ms=args.snap_ms,
+                clause_min_pause_ms=args.clause_min_pause_ms,
+                silence_min_pause_ms=args.silence_min_pause_ms,
+                drop_unsplit_oversized=not args.no_drop_unsplit_oversized,
             )
             total_dropped_ms += sum(e - s for s, e in dropped)
 
-            for chunk_meta in kept:
-                start_ms = chunk_meta["start_ms"]
-                end_ms = chunk_meta["end_ms"]
-                chunk = audio[start_ms:end_ms]
+            for k, chunk_meta in enumerate(kept):
+                raw_start = chunk_meta["start_ms"]
+                raw_end = chunk_meta["end_ms"]
+                prev_end = kept[k - 1]["end_ms"] if k > 0 else 0
+                next_start = kept[k + 1]["start_ms"] if k < len(kept) - 1 else len(audio)
+
+                lead_min_ms = max(prev_end, raw_start - 250)
+                snapped_start = _find_acoustic_boundary_ms(
+                    samples_24k,
+                    target_ms=raw_start,
+                    search_left_ms=lead_min_ms,
+                    search_right_ms=raw_start,
+                    is_end=False,
+                    sample_rate=args.sample_rate,
+                )
+
+                tail_max_ms = min(next_start, raw_end + 350)
+                snapped_end = _find_acoustic_boundary_ms(
+                    samples_24k,
+                    target_ms=raw_end,
+                    search_left_ms=raw_end,
+                    search_right_ms=tail_max_ms,
+                    is_end=True,
+                    sample_rate=args.sample_rate,
+                )
+
+                if snapped_end - snapped_start < min_ms:
+                    snapped_start = max(0, raw_start - args.pad_ms)
+                    snapped_end = min(len(audio), raw_end + args.pad_ms)
+
+                chunk = audio[snapped_start:snapped_end]
+                chunk = apply_micro_fade(chunk, fade_ms=args.fade_ms)
                 out_file = output_path / f"chunk_{chunk_counter:04d}.wav"
                 chunk.export(str(out_file), format="wav")
 
-                if chunk_meta.get("word_split"):
-                    n_word_split += 1
+                if chunk_meta.get("clause_split"):
+                    n_clause_split += 1
                 if chunk_meta.get("hard_cut"):
                     n_hard_cut += 1
 
@@ -565,9 +755,9 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
                 manifest.append({
                     "file": out_file.name,
                     "source": audio_file.name,
-                    "start_ms": int(start_ms),
-                    "end_ms": int(end_ms),
-                    "duration_s": round((end_ms - start_ms) / 1000.0, 3),
+                    "start_ms": int(snapped_start),
+                    "end_ms": int(snapped_end),
+                    "duration_s": round((snapped_end - snapped_start) / 1000.0, 3),
                     "speech_dbfs": round(cstats["speech_dbfs"], 2),
                     "noise_dbfs": round(cstats["noise_dbfs"], 2),
                     "peak_dbfs": round(cstats["peak_dbfs"], 2),
@@ -588,8 +778,36 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
             )
             total_dropped_ms += sum(e - s for s, e in dropped)
 
-            for start_ms, end_ms in kept:
-                chunk = audio[start_ms:end_ms]
+            for k, (start_ms, end_ms) in enumerate(kept):
+                prev_end = kept[k - 1][1] if k > 0 else 0
+                next_start = kept[k + 1][0] if k < len(kept) - 1 else len(audio)
+
+                lead_min_ms = max(prev_end, start_ms - 250)
+                snapped_start = _find_acoustic_boundary_ms(
+                    samples_24k,
+                    target_ms=start_ms,
+                    search_left_ms=lead_min_ms,
+                    search_right_ms=start_ms,
+                    is_end=False,
+                    sample_rate=args.sample_rate,
+                )
+
+                tail_max_ms = min(next_start, end_ms + 350)
+                snapped_end = _find_acoustic_boundary_ms(
+                    samples_24k,
+                    target_ms=end_ms,
+                    search_left_ms=end_ms,
+                    search_right_ms=tail_max_ms,
+                    is_end=True,
+                    sample_rate=args.sample_rate,
+                )
+
+                if snapped_end - snapped_start < min_ms:
+                    snapped_start = max(0, start_ms - args.pad_ms)
+                    snapped_end = min(len(audio), end_ms + args.pad_ms)
+
+                chunk = audio[snapped_start:snapped_end]
+                chunk = apply_micro_fade(chunk, fade_ms=args.fade_ms)
                 out_file = output_path / f"chunk_{chunk_counter:04d}.wav"
                 chunk.export(str(out_file), format="wav")
 
@@ -597,9 +815,9 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
                 manifest.append({
                     "file": out_file.name,
                     "source": audio_file.name,
-                    "start_ms": int(start_ms),
-                    "end_ms": int(end_ms),
-                    "duration_s": round((end_ms - start_ms) / 1000.0, 3),
+                    "start_ms": int(snapped_start),
+                    "end_ms": int(snapped_end),
+                    "duration_s": round((snapped_end - snapped_start) / 1000.0, 3),
                     "speech_dbfs": round(cstats["speech_dbfs"], 2),
                     "noise_dbfs": round(cstats["noise_dbfs"], 2),
                     "peak_dbfs": round(cstats["peak_dbfs"], 2),
@@ -639,7 +857,7 @@ def chunk_audio_files(audio_files, output_path, args, asr_model=None):
         "n_chunks": len(manifest),
         "total_min": round(sum(durations) / 60.0, 2) if durations else 0.0,
         "dropped_sec": round(total_dropped_ms / 1000.0, 1),
-        "n_word_split": n_word_split,
+        "n_clause_split": n_clause_split,
         "n_hard_cut": n_hard_cut,
         **s_stats,
     }
@@ -694,7 +912,7 @@ def process_audio_files(args):
 
     output_path.mkdir(parents=True, exist_ok=True)
     params = {
-        "version": 3,
+        "version": 4,
         "sample_rate": args.sample_rate,
         "sentence_aware": not args.no_sentence_aware,
         "asr_model": args.asr_model if not args.no_sentence_aware else None,
@@ -706,6 +924,10 @@ def process_audio_files(args):
         "merge_gap_ms": args.merge_gap_ms,
         "segment_gap_ms": args.segment_gap_ms,
         "orphan_gap_ms": args.orphan_gap_ms,
+        "clause_min_pause_ms": args.clause_min_pause_ms,
+        "silence_min_pause_ms": args.silence_min_pause_ms,
+        "fade_ms": args.fade_ms,
+        "drop_unsplit_oversized": not args.no_drop_unsplit_oversized,
         "snap_ms": args.snap_ms,
         "pad_ms": args.pad_ms,
         "seek_step_ms": args.seek_step_ms,
@@ -728,8 +950,8 @@ if __name__ == "__main__":
                         help="Output directory for chunks")
     parser.add_argument("--min_length_sec", type=float, default=3.0,
                         help="Minimum chunk length; shorter spans are dropped, not kept")
-    parser.add_argument("--max_length_sec", type=float, default=10.0,
-                        help="Maximum chunk length")
+    parser.add_argument("--max_length_sec", type=float, default=11.0,
+                        help="Maximum chunk length (Qwen3-TTS handles up to 12s cleanly)")
     parser.add_argument("--sample_rate", type=int, default=TARGET_SR,
                         help="Output sample rate (Qwen3-TTS expects 24000)")
     parser.add_argument("--target_dbfs", type=float, default=-23.0,
@@ -746,6 +968,14 @@ if __name__ == "__main__":
                         help="Merge adjacent sentences separated by at most this gap")
     parser.add_argument("--orphan_gap_ms", type=int, default=3000,
                         help="Allow wider gap while group is below min_length_sec")
+    parser.add_argument("--clause_min_pause_ms", type=int, default=120,
+                        help="Minimum pause required to split an oversized sentence at a comma or clause mark")
+    parser.add_argument("--silence_min_pause_ms", type=int, default=250,
+                        help="Minimum acoustic pause required to split an oversized sentence without clause punctuation")
+    parser.add_argument("--fade_ms", type=int, default=10,
+                        help="Micro-fade in/out duration in milliseconds applied to chunk boundaries")
+    parser.add_argument("--no_drop_unsplit_oversized", action="store_true",
+                        help="Do not drop oversized run-on sentences without pauses; fall back to blind midpoint cut")
     parser.add_argument("--snap_ms", type=int, default=300,
                         help="Snap ASR cut points to nearest silence edge within this window")
     parser.add_argument("--pad_ms", type=int, default=200,

@@ -403,6 +403,22 @@ class Qwen3TTSPipeline:
             return "no_alpha"
         if sum(c not in ALLOWED_CHARS for c in text) / len(text) > 0.05:
             return "charset"
+
+        stripped = text.strip()
+        first_char = stripped[0]
+        if not (first_char.isupper() or first_char.isdigit() or first_char in "\"'“‘("):
+            return "not_capitalized"
+
+        last_char = stripped[-1]
+        if last_char in "\"'”’)":
+            last_char = stripped[-2] if len(stripped) > 1 else ""
+        if last_char not in ".?!":
+            return "no_terminal_punct"
+
+        last_word = re.sub(r"[^a-zA-Z]", "", words[-1]).lower()
+        if last_word in ("and", "or", "but", "so", "because", "that", "with", "as", "if", "than"):
+            return "hanging_conjunction"
+
         lowered = [w.lower().strip(".,?!\"'") for w in words]
         for n in (1, 2, 3):
             run = 1
